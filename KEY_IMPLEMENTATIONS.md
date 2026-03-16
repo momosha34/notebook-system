@@ -1,103 +1,182 @@
 # 个人笔记本系统 - 关键代码实现
 
-本文档记录了系统各功能模块的关键代码片段，便于快速理解和维护。
+本文档详细记录了系统各功能模块的关键代码实现，便于快速理解和维护。
 
----
+***
 
 ## 目录
 
-1. [用户认证](#1-用户认证)
-2. [笔记管理](#2-笔记管理)
-3. [邮件发送](#3-邮件发送)
-4. [图片上传](#4-图片上传)
-5. [定时任务](#5-定时任务)
-6. [前端编辑器](#6-前端编辑器)
+1. [JWT 认证中间件](#1-jwt-认证中间件)
+2. [用户认证](#2-用户认证)
+3. [笔记管理与全文搜索](#3-笔记管理与全文搜索)
+4. [邮件发送与 CID 内嵌图片](#4-邮件发送与-cid-内嵌图片)
+5. [图片上传与自动压缩](#5-图片上传与自动压缩)
+6. [定时任务](#6-定时任务)
+7. [数据库初始化](#7-数据库初始化)
+8. [前端路由与认证](#8-前端路由与认证)
+9. [前端编辑器与笔记保存](#9-前端编辑器与笔记保存)
 
----
+***
 
-## 1. 用户认证
+## 1. JWT 认证中间件
 
-### 1.1 密码加密存储
+**文件**: [backend/middleware/auth.js](backend/middleware/auth.js)
+
+### 1.1 Token 生成
+
+```javascript
+import jwt from 'jsonwebtoken';
+
+const SECRET_KEY = 'your-secret-key-change-in-production';
+
+// 生成JWT token，有效期7天
+function generateToken(userId, username) {
+  return jwt.sign(
+    { userId: userId, username: username },
+    SECRET_KEY,
+    { expiresIn: '7d' }
+  );
+}
+```
+
+### 1.2 Token 验证中间件
+
+```javascript
+// JWT验证中间件
+function verifyToken(req, res, next) {
+  const authHeader = req.headers.authorization;
+  
+  // 向后兼容：如果没有Authorization头，尝试使用user-id头
+  if (!authHeader) {
+    const userId = req.headers['user-id'];
+    if (userId) {
+      req.userId = userId;
+      return next();
+    }
+    return res.status(401).json({ error: '未授权访问' });
+  }
+  
+  // 提取token
+  const token = authHeader.split(' ')[1];
+  if (!token) {
+    return res.status(401).json({ error: '无效的token格式' });
+  }
+  
+  try {
+    // 验证token
+    const decoded = jwt.verify(token, SECRET_KEY);
+    req.userId = decoded.userId.toString();
+    next();
+  } catch (error) {
+    return res.status(401).json({ error: '无效的token' });
+  }
+}
+```
+
+**设计要点**:
+
+- 使用 `jsonwebtoken` 库生成和验证 JWT
+- Token 有效期 7 天
+- 向后兼容旧版本的 `user-id` header
+- 验证失败返回 401 状态码
+
+***
+
+## 2. 用户认证
 
 **文件**: [backend/routes/auth.js](backend/routes/auth.js)
 
+### 2.1 用户注册
+
 ```javascript
 import bcrypt from 'bcryptjs';
+import { generateToken } from '../middleware/auth.js';
 
-// 注册时密码加密
 router.post('/register', async (req, res) => {
   const { username, password } = req.body;
   
-  // 使用 bcrypt 加密密码，salt rounds = 10
-  const hashedPassword = await bcrypt.hash(password, 10);
+  if (!username || !password) {
+    return res.status(400).json({ error: '用户名和密码不能为空' });
+  }
+
+  try {
+    // 使用 bcrypt 加密密码，salt rounds = 10
+    const hashedPassword = await bcrypt.hash(password, 10);
+    
+    db.run(
+      'INSERT INTO user (username, password) VALUES (?, ?)',
+      [username, hashedPassword],
+      function(err) {
+        if (err) {
+          if (err.message.includes('UNIQUE constraint failed')) {
+            return res.status(400).json({ error: '用户名已存在' });
+          }
+          return res.status(500).json({ error: '注册失败' });
+        }
+        // 注册成功，生成JWT token
+        const token = generateToken(this.lastID, username);
+        res.json({ 
+          token, 
+          username, 
+          message: '注册成功',
+          user: { id: this.lastID, username }
+        });
+      }
+    );
+  } catch (error) {
+    res.status(500).json({ error: '服务器错误' });
+  }
+});
+```
+
+### 2.2 用户登录
+
+```javascript
+router.post('/login', (req, res) => {
+  const { username, password } = req.body;
   
-  db.run(
-    'INSERT INTO user (username, password) VALUES (?, ?)',
-    [username, hashedPassword],
-    function(err) {
-      // 处理结果...
+  if (!username || !password) {
+    return res.status(400).json({ error: '用户名和密码不能为空' });
+  }
+
+  db.get(
+    'SELECT * FROM user WHERE username = ?',
+    [username],
+    async (err, user) => {
+      if (err) {
+        return res.status(500).json({ error: '服务器错误' });
+      }
+      
+      if (!user) {
+        return res.status(400).json({ error: '用户不存在' });
+      }
+      
+      // 使用 bcrypt 比较明文密码和加密后的密码
+      const isValid = await bcrypt.compare(password, user.password);
+      if (!isValid) {
+        return res.status(400).json({ error: '密码错误' });
+      }
+      
+      // 登录成功，生成JWT token
+      const token = generateToken(user.id, user.username);
+      res.json({ 
+        token, 
+        username, 
+        message: '登录成功',
+        user: { id: user.id, username: user.username }
+      });
     }
   );
 });
 ```
 
-### 1.2 密码验证
+***
 
-```javascript
-// 登录时密码校验
-router.post('/login', (req, res) => {
-  const { username, password } = req.body;
-  
-  db.get('SELECT * FROM user WHERE username = ?', [username], async (err, user) => {
-    if (!user) {
-      return res.status(400).json({ error: '用户不存在' });
-    }
-    
-    // 使用 bcrypt 比较明文密码和加密后的密码
-    const isValid = await bcrypt.compare(password, user.password);
-    if (!isValid) {
-      return res.status(400).json({ error: '密码错误' });
-    }
-    
-    // 返回用户ID作为简单token
-    const token = user.id.toString();
-    res.json({ token, username, user: { id: user.id, username: user.username } });
-  });
-});
-```
-
----
-
-## 2. 笔记管理
-
-### 2.1 笔记列表查询（支持搜索）
+## 3. 笔记管理与全文搜索
 
 **文件**: [backend/routes/notes.js](backend/routes/notes.js)
 
-```javascript
-router.get('/notes', (req, res) => {
-  const { s } = req.query;  // 搜索关键字
-  const userId = req.headers['user-id'];
-  
-  let sql = 'SELECT * FROM note WHERE user_id = ? AND is_del = 0';
-  let params = [userId];
-  
-  // 支持标题和内容的模糊搜索
-  if (s) {
-    sql += ' AND (title LIKE ? OR content LIKE ?)';
-    params.push(`%${s}%`);
-    params.push(`%${s}%`);
-  }
-  
-  sql += ' ORDER BY updated_at DESC';
-  
-  db.all(sql, params, (err, notes) => {
-    res.json(notes);
-  });
-});
-```
-
-### 2.2 笔记新建/更新（合并接口）
+### 3.1 本地时间生成
 
 ```javascript
 function getLocalTimeString() {
@@ -110,11 +189,78 @@ function getLocalTimeString() {
   const seconds = String(now.getSeconds()).padStart(2, '0');
   return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
 }
+```
 
-router.post('/note', (req, res) => {
+### 3.2 HTML 标签去除（用于搜索索引）
+
+```javascript
+function stripHtml(html) {
+  if (!html) return '';
+  return html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+}
+```
+
+### 3.3 FTS 查询语句转义
+
+```javascript
+function escapeFtsQuery(query) {
+  if (!query) return '';
+  const escaped = query.replace(/['"]/g, '').replace(/[^\w\u4e00-\u9fa5\s]/g, ' ');
+  const terms = escaped.trim().split(/\s+/).filter(t => t.length > 0);
+  return terms.map(t => `${t}*`).join(' OR ');
+}
+```
+
+### 3.4 笔记列表查询（支持 FTS5 全文搜索）
+
+```javascript
+router.get('/notes', verifyToken, (req, res) => {
+  const { s } = req.query;
+  const userId = req.userId;
+  
+  if (s && s.trim()) {
+    const ftsQuery = escapeFtsQuery(s);
+    const sql = `
+      SELECT n.* FROM note n
+      JOIN note_fts fts ON n.id = fts.id
+      WHERE n.user_id = ? AND n.is_del = 0
+      AND note_fts MATCH ?
+      ORDER BY n.updated_at DESC
+    `;
+    db.all(sql, [userId, ftsQuery], (err, notes) => {
+      if (err) {
+        console.error('FTS搜索失败，回退到LIKE搜索:', err.message);
+        const fallbackSql = 'SELECT * FROM note WHERE user_id = ? AND is_del = 0 AND (title LIKE ? OR content LIKE ?) ORDER BY updated_at DESC';
+        db.all(fallbackSql, [userId, `%${s}%`, `%${s}%`], (err2, notes2) => {
+          if (err2) {
+            return res.status(500).json({ error: '获取笔记失败' });
+          }
+          res.json(notes2);
+        });
+        return;
+      }
+      res.json(notes);
+    });
+  } else {
+    const sql = 'SELECT * FROM note WHERE user_id = ? AND is_del = 0 ORDER BY updated_at DESC';
+    db.all(sql, [userId], (err, notes) => {
+      if (err) {
+        return res.status(500).json({ error: '获取笔记失败' });
+      }
+      res.json(notes);
+    });
+  }
+});
+```
+
+### 3.5 笔记创建/更新（同步 FTS 索引）
+
+```javascript
+router.post('/note', verifyToken, (req, res) => {
   const { id, title, content, sheet_data } = req.body;
-  const userId = req.headers['user-id'];
+  const userId = req.userId;
   const currentTime = getLocalTimeString();
+  const plainContent = stripHtml(content);
   
   if (id) {
     // 更新现有笔记
@@ -122,6 +268,19 @@ router.post('/note', (req, res) => {
       'UPDATE note SET title = ?, content = ?, sheet_data = ?, updated_at = ? WHERE id = ? AND user_id = ?',
       [title, content, sheet_data, currentTime, id, userId],
       function(err) {
+        if (err) {
+          return res.status(500).json({ error: '更新笔记失败' });
+        }
+        // 更新 FTS 索引
+        db.run(
+          'UPDATE note_fts SET title = ?, content = ? WHERE id = ?',
+          [title, plainContent, id],
+          (ftsErr) => {
+            if (ftsErr) {
+              console.error('更新FTS索引失败:', ftsErr.message);
+            }
+          }
+        );
         res.json({ id, message: '更新成功' });
       }
     );
@@ -131,151 +290,101 @@ router.post('/note', (req, res) => {
       'INSERT INTO note (user_id, title, content, sheet_data, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
       [userId, title, content, sheet_data, currentTime, currentTime],
       function(err) {
-        res.json({ id: this.lastID, message: '创建成功' });
+        if (err) {
+          return res.status(500).json({ error: '创建笔记失败' });
+        }
+        const newId = this.lastID;
+        // 插入 FTS 索引
+        db.run(
+          'INSERT INTO note_fts (id, user_id, title, content) VALUES (?, ?, ?, ?)',
+          [newId, userId, title, plainContent],
+          (ftsErr) => {
+            if (ftsErr) {
+              console.error('插入FTS索引失败:', ftsErr.message);
+            }
+          }
+        );
+        res.json({ id: newId, message: '创建成功' });
       }
     );
   }
 });
 ```
 
-### 2.3 软删除与回收站
+### 3.6 软删除与 FTS 索引清理
 
 ```javascript
-// 软删除：标记 is_del = 1
-router.delete('/note/:id', (req, res) => {
+router.delete('/note/:id', verifyToken, (req, res) => {
+  const { id } = req.params;
+  const userId = req.userId;
+  
   db.run(
     'UPDATE note SET is_del = 1 WHERE id = ? AND user_id = ?',
     [id, userId],
     function(err) {
+      if (err) {
+        return res.status(500).json({ error: '删除失败' });
+      }
+      if (this.changes === 0) {
+        return res.status(404).json({ error: '笔记不存在' });
+      }
+      // 从 FTS 索引中删除
+      db.run('DELETE FROM note_fts WHERE id = ?', [id], (ftsErr) => {
+        if (ftsErr) {
+          console.error('删除FTS索引失败:', ftsErr.message);
+        }
+      });
       res.json({ message: '删除成功' });
     }
   );
 });
+```
 
-// 恢复笔记
-router.put('/note/:id/recover', (req, res) => {
+### 3.7 恢复笔记（重建 FTS 索引）
+
+```javascript
+router.put('/note/:id/recover', verifyToken, (req, res) => {
+  const { id } = req.params;
+  const userId = req.userId;
+  
   db.run(
     'UPDATE note SET is_del = 0 WHERE id = ? AND user_id = ?',
     [id, userId],
     function(err) {
+      if (err) {
+        return res.status(500).json({ error: '恢复笔记失败' });
+      }
+      if (this.changes === 0) {
+        return res.status(404).json({ error: '笔记不存在' });
+      }
+      // 重建 FTS 索引
+      db.get('SELECT title, content FROM note WHERE id = ?', [id], (err, note) => {
+        if (note) {
+          const plainContent = stripHtml(note.content);
+          db.run(
+            'INSERT OR REPLACE INTO note_fts (id, user_id, title, content) VALUES (?, ?, ?, ?)',
+            [id, userId, note.title, plainContent],
+            (ftsErr) => {
+              if (ftsErr) {
+                console.error('恢复FTS索引失败:', ftsErr.message);
+              }
+            }
+          );
+        }
+      });
       res.json({ message: '恢复成功' });
     }
   );
 });
-
-// 永久删除
-router.delete('/trash/note/:id', (req, res) => {
-  db.run(
-    'DELETE FROM note WHERE id = ? AND user_id = ? AND is_del = 1',
-    [id, userId],
-    function(err) {
-      res.json({ message: '永久删除成功' });
-    }
-  );
-});
 ```
 
-### 2.4 本地时间显示（实时同步）
+***
 
-**文件**: 
-- [backend/routes/notes.js](backend/routes/notes.js)
-- [frontend/src/components/NoteCard.vue](frontend/src/components/NoteCard.vue)
-- [frontend/src/views/Share.vue](frontend/src/views/Share.vue)
-
-> **重要说明**: 系统现在使用服务器本地时间存储和显示，不再进行手动时区转换。修复了之前 UTC 时间导致的 8 小时时差问题。
-
-**后端实现**: 使用 JavaScript 本地时间方法生成时间字符串
-
-```javascript
-// backend/routes/notes.js - 生成本地时间字符串
-function getLocalTimeString() {
-  const now = new Date();
-  const year = now.getFullYear();
-  const month = String(now.getMonth() + 1).padStart(2, '0');
-  const day = String(now.getDate()).padStart(2, '0');
-  const hours = String(now.getHours()).padStart(2, '0');
-  const minutes = String(now.getMinutes()).padStart(2, '0');
-  const seconds = String(now.getSeconds()).padStart(2, '0');
-  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
-}
-```
-
-**前端实现 - NoteCard.vue**: 简化时间显示逻辑，直接使用本地时间
-
-```javascript
-// frontend/src/components/NoteCard.vue - computed property
-computed: {
-  formattedTime() {
-    if (!this.note.updated_at) {
-      return ''
-    }
-    
-    let noteTimeStr = this.note.updated_at
-    if (typeof noteTimeStr === 'string' && noteTimeStr.includes(' ')) {
-      // 处理 'YYYY-MM-DD HH:MM:SS' 本地时间格式
-      noteTimeStr = noteTimeStr.replace(' ', 'T')
-    }
-    
-    const noteTime = new Date(noteTimeStr).getTime()
-    const now = this.currentTime
-    const diff = now - noteTime
-    
-    if (isNaN(noteTime)) {
-      return '未知时间'
-    }
-    
-    if (diff < 0 || diff < 60000) {
-      return '刚刚'
-    } else if (diff < 3600000) {
-      return `${Math.floor(diff / 60000)}分钟前`
-    } else if (diff < 86400000) {
-      return `${Math.floor(diff / 3600000)}小时前`
-    } else {
-      const date = new Date(noteTime)
-      return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
-    }
-  }
-}
-
-// 实时同步，每30秒更新一次
-mounted() {
-  this.updateTime()
-  this.timeUpdater = setInterval(() => {
-    this.updateTime()
-  }, 30000)
-}
-```
-
-**前端实现 - Share.vue**: 同样简化时间格式化
-
-```javascript
-// frontend/src/views/Share.vue - 格式化时间为本地时间
-const formatTime = (timeString) => {
-  if (!timeString) return '未知时间'
-  
-  let noteTimeStr = timeString
-  if (typeof noteTimeStr === 'string' && noteTimeStr.includes(' ')) {
-    // 处理 'YYYY-MM-DD HH:MM:SS' 本地时间格式
-    noteTimeStr = noteTimeStr.replace(' ', 'T')
-  }
-  
-  const time = new Date(noteTimeStr)
-  
-  if (isNaN(time.getTime())) {
-    return '未知时间'
-  }
-  
-  return `${time.getFullYear()}-${String(time.getMonth() + 1).padStart(2, '0')}-${String(time.getDate()).padStart(2, '0')} ${String(time.getHours()).padStart(2, '0')}:${String(time.getMinutes()).padStart(2, '0')}`
-}
-```
-
----
-
-## 3. 邮件发送
-
-### 3.1 SendCloud API 配置
+## 4. 邮件发送与 CID 内嵌图片
 
 **文件**: [backend/routes/share.js](backend/routes/share.js)
+
+### 4.1 SendCloud API 配置
 
 ```javascript
 const EMAIL_API_CONFIG = {
@@ -286,7 +395,7 @@ const EMAIL_API_CONFIG = {
 };
 ```
 
-### 3.2 邮件图片压缩功能
+### 4.2 邮件图片压缩
 
 ```javascript
 async function compressImageForEmail(imagePath) {
@@ -300,12 +409,14 @@ async function compressImageForEmail(imagePath) {
     const metadata = await image.metadata();
     const originalSize = fs.statSync(imagePath).size;
     
+    // 如果图片已经符合要求，直接返回
     if (originalSize <= MAX_EMAIL_IMAGE_SIZE && 
         metadata.width <= MAX_EMAIL_IMAGE_WIDTH && 
         metadata.height <= MAX_EMAIL_IMAGE_HEIGHT) {
       return { success: true, compressed: false, path: imagePath };
     }
     
+    // 计算目标尺寸
     let needsResize = false;
     let targetWidth = metadata.width;
     let targetHeight = metadata.height;
@@ -322,6 +433,7 @@ async function compressImageForEmail(imagePath) {
       needsResize = true;
     }
     
+    // 调整尺寸
     if (needsResize) {
       image = image.resize(targetWidth, targetHeight, {
         fit: 'inside',
@@ -329,6 +441,7 @@ async function compressImageForEmail(imagePath) {
       });
     }
     
+    // 根据格式设置压缩质量
     if (ext === '.jpg' || ext === '.jpeg') {
       image = image.jpeg({ quality: 80 });
     } else if (ext === '.png') {
@@ -339,11 +452,14 @@ async function compressImageForEmail(imagePath) {
       return { success: true, compressed: false, path: imagePath };
     }
     
+    // 保存临时压缩文件
     const tempPath = imagePath + '.email_compressed';
     await image.toFile(tempPath);
     
+    // 检查压缩效果
     const tempStats = fs.statSync(tempPath);
     if (tempStats.size < originalSize) {
+      console.log(`邮件图片压缩成功: ${path.basename(imagePath)} (${(originalSize/1024).toFixed(1)}KB -> ${(tempStats.size/1024).toFixed(1)}KB)`);
       return { success: true, compressed: true, path: tempPath, originalPath: imagePath };
     } else {
       fs.unlinkSync(tempPath);
@@ -356,7 +472,87 @@ async function compressImageForEmail(imagePath) {
 }
 ```
 
-### 3.3 API 邮件发送核心函数（支持 CID 内嵌图片）
+### 4.3 处理内容图片为 CID 格式
+
+```javascript
+async function processContentImagesToCidFormat(content, userId) {
+  try {
+    const { load } = await import('cheerio');
+    const $ = load(content);
+    
+    const __dirname = dirname(fileURLToPath(import.meta.url));
+    const imagesInfo = [];
+    const compressedFiles = [];
+    
+    // 遍历所有图片标签
+    $('img').each((i, img) => {
+      const src = $(img).attr('src');
+      
+      if (src && src.startsWith('/uploads/')) {
+        const match = src.match(/\/uploads\/(\d+)\/(image-[^/]+\.(jpg|jpeg|png|gif|webp|bmp))/i);
+        if (match) {
+          const imageUserId = match[1];
+          const imageFilename = match[2];
+          
+          if (imageUserId === String(userId)) {
+            const cid = `note_image_${i}_${Date.now()}`;
+            const imagePath = path.join(__dirname, '..', 'uploads', imageUserId, imageFilename);
+            
+            const ext = path.extname(imageFilename).toLowerCase();
+            let mimeType = 'image/jpeg';
+            if (ext === '.png') mimeType = 'image/png';
+            else if (ext === '.gif') mimeType = 'image/gif';
+            else if (ext === '.webp') mimeType = 'image/webp';
+            else if (ext === '.bmp') mimeType = 'image/bmp';
+            
+            imagesInfo.push({
+              index: i,
+              filename: imageFilename,
+              originalPath: imagePath,
+              path: imagePath,
+              cid: cid,
+              mimeType: mimeType
+            });
+            
+            // 替换 src 为 cid
+            $(img).attr('src', `cid:${cid}`);
+            $(img).attr('style', 'max-width: 100% !important; height: auto !important; display: block !important; margin: 10px auto !important; border-radius: 4px !important; border: 2px solid #e9ecef !important;');
+            $(img).attr('alt', `图片 ${i + 1}: ${imageFilename}`);
+            $(img).removeAttr('loading');
+            $(img).removeAttr('decoding');
+            
+            console.log(`图片处理：${imageFilename} -> CID: ${cid}, 路径：${imagePath}`);
+          } else {
+            $(img).replaceWith(`<p style="color: #999; font-style: italic; font-size: 14px;">[无权访问]</p>`);
+          }
+        }
+      }
+    });
+    
+    // 压缩所有图片
+    for (const imageInfo of imagesInfo) {
+      const compressResult = await compressImageForEmail(imageInfo.originalPath);
+      if (compressResult.success) {
+        imageInfo.path = compressResult.path;
+        if (compressResult.compressed) {
+          imageInfo.compressed = true;
+          if (compressResult.originalPath) {
+            compressedFiles.push(compressResult.path);
+          }
+        }
+      }
+    }
+    
+    const processedHtml = $.html();
+    return { html: processedHtml, imagesInfo, compressedFiles };
+  } catch (error) {
+    console.error('处理内容图片失败:', error);
+    return { html: content, imagesInfo: [], compressedFiles: [] };
+  }
+}
+```
+
+### 4.4 邮件发送核心函数
 
 ```javascript
 async function sendEmailViaApi(toEmail, subject, htmlContent, textContent, imagesInfo = []) {
@@ -376,6 +572,7 @@ async function sendEmailViaApi(toEmail, subject, htmlContent, textContent, image
     try {
       if (fs.existsSync(imageInfo.path)) {
         const fileStats = fs.statSync(imageInfo.path);
+        console.log(`添加内嵌图片：${imageInfo.filename} (CID: ${imageInfo.cid}, 大小：${(fileStats.size/1024).toFixed(1)}KB)`);
         
         form.append('attachments', fs.createReadStream(imageInfo.path), {
           filename: imageInfo.filename,
@@ -444,275 +641,149 @@ async function sendEmailViaApi(toEmail, subject, htmlContent, textContent, image
 }
 ```
 
-### 3.4 邮件内容构建（使用 CID 内嵌图片）
+### 4.5 邮件发送接口
 
 ```javascript
-async function processContentImagesToCidFormat(content, userId) {
+router.post('/send-email', verifyToken, async (req, res) => {
+  const { email, noteId } = req.body;
+  const userId = req.userId;
+  
+  if (!email) {
+    return res.status(400).json({ error: '邮箱不能为空' });
+  }
+  if (!noteId) {
+    return res.status(400).json({ error: '笔记ID不能为空' });
+  }
+
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email)) {
+    return res.status(400).json({ error: '邮箱格式不正确' });
+  }
+
   try {
-    const { load } = await import('cheerio');
-    const $ = load(content);
-    
-    const __dirname = dirname(fileURLToPath(import.meta.url));
-    const imagesInfo = [];
-    const compressedFiles = [];
-    
-    $('img').each((i, img) => {
-      const src = $(img).attr('src');
-      
-      if (src && src.startsWith('/uploads/')) {
-        const match = src.match(/\/uploads\/(\d+)\/(image-[^/]+\.(jpg|jpeg|png|gif|webp|bmp))/i);
-        if (match) {
-          const imageUserId = match[1];
-          const imageFilename = match[2];
-          
-          if (imageUserId === String(userId)) {
-            const cid = `note_image_${i}_${Date.now()}`;
-            const imagePath = path.join(__dirname, '..', 'uploads', imageUserId, imageFilename);
-            
-            const ext = path.extname(imageFilename).toLowerCase();
-            let mimeType = 'image/jpeg';
-            if (ext === '.png') mimeType = 'image/png';
-            else if (ext === '.gif') mimeType = 'image/gif';
-            else if (ext === '.webp') mimeType = 'image/webp';
-            else if (ext === '.bmp') mimeType = 'image/bmp';
-            
-            imagesInfo.push({
-              index: i,
-              filename: imageFilename,
-              originalPath: imagePath,
-              path: imagePath,
-              cid: cid,
-              mimeType: mimeType
-            });
-            
-            $(img).attr('src', `cid:${cid}`);
-            $(img).attr('style', 'max-width: 100% !important; height: auto !important; display: block !important; margin: 10px auto !important; border-radius: 4px !important; border: 2px solid #e9ecef !important;');
-            $(img).attr('alt', `图片 ${i + 1}: ${imageFilename}`);
-          }
+    // 获取笔记
+    const note = await new Promise((resolve, reject) => {
+      db.get(
+        'SELECT * FROM note WHERE id = ? AND is_del = 0',
+        [noteId],
+        (err, row) => {
+          if (err) reject(err);
+          else resolve(row);
         }
-      }
+      );
     });
     
-    for (const imageInfo of imagesInfo) {
-      const compressResult = await compressImageForEmail(imageInfo.originalPath);
-      if (compressResult.success) {
-        imageInfo.path = compressResult.path;
-        if (compressResult.compressed) {
-          imageInfo.compressed = true;
-          if (compressResult.originalPath) {
-            compressedFiles.push(compressResult.path);
+    if (!note) {
+      return res.status(404).json({ error: '笔记不存在' });
+    }
+
+    // 构建邮件内容
+    const { html, imagesInfo, compressedFiles } = await buildEmailContentWithCidImages(note, userId);
+
+    console.log('=== 邮件发送调试信息 ===');
+    console.log('笔记 ID:', noteId);
+    console.log('笔记标题:', note.title);
+    console.log('HTML 大小:', Buffer.byteLength(html, 'utf8'), 'bytes');
+    console.log('图片数量:', imagesInfo.length);
+    console.log('========================');
+
+    // 检查邮件大小
+    const htmlSize = Buffer.byteLength(html, 'utf8');
+    const maxSize = 15 * 1024 * 1024;
+    
+    if (htmlSize > maxSize) {
+      for (const tempFile of compressedFiles) {
+        try {
+          if (fs.existsSync(tempFile)) {
+            fs.unlinkSync(tempFile);
           }
+        } catch (cleanupError) {
+          console.error('清理临时文件失败:', cleanupError);
+        }
+      }
+      return res.status(400).json({ 
+        error: `邮件内容过大 (${(htmlSize/1024/1024).toFixed(1)}MB)，请减少图片数量或降低图片质量` 
+      });
+    }
+
+    // 计算图片总大小
+    let totalImageSize = 0;
+    for (const imgInfo of imagesInfo) {
+      try {
+        if (fs.existsSync(imgInfo.path)) {
+          totalImageSize += fs.statSync(imgInfo.path).size;
+        }
+      } catch (e) {}
+    }
+
+    console.log(`发送邮件: HTML大小 ${(htmlSize/1024).toFixed(1)}KB, 图片总大小 ${(totalImageSize/1024).toFixed(1)}KB, 内嵌图片数量: ${imagesInfo.length}`);
+
+    // 纯文本版本
+    const textContent = `
+笔记分享: ${note.title || '无标题笔记'}
+创建时间: ${formatDate(note.created_at)}
+更新时间: ${formatDate(note.updated_at)}
+笔记内容:
+${note.content ? note.content.replace(/<[^>]*>/g, '').substring(0, 500) + '...' : '暂无内容'}
+---
+此邮件由个人笔记本系统自动发送
+    `.trim();
+
+    const subject = `笔记分享: ${note.title || '无标题笔记'}`;
+
+    try {
+      const result = await sendEmailViaApi(email, subject, html, textContent, imagesInfo);
+      
+      console.log('邮件发送成功:', result.messageId);
+      res.json({ 
+        message: '邮件发送成功',
+        stats: {
+          htmlSize: `${(htmlSize/1024).toFixed(1)}KB`,
+          imageSize: `${(totalImageSize/1024).toFixed(1)}KB`,
+          imageCount: imagesInfo.length,
+          compressedCount: imagesInfo.filter(i => i.compressed).length
+        }
+      });
+    } finally {
+      // 清理临时压缩文件
+      for (const tempFile of compressedFiles) {
+        try {
+          if (fs.existsSync(tempFile)) {
+            fs.unlinkSync(tempFile);
+            console.log('已清理临时压缩文件:', tempFile);
+          }
+        } catch (cleanupError) {
+          console.error('清理临时文件失败:', cleanupError);
         }
       }
     }
     
-    const processedHtml = $.html();
-    return { html: processedHtml, imagesInfo, compressedFiles };
   } catch (error) {
-    console.error('处理内容图片失败:', error);
-    return { html: content, imagesInfo: [], compressedFiles: [] };
+    console.error('邮件发送失败:', error);
+    let errorMessage = '邮件发送失败';
+    if (error.message.includes('网络请求失败') || error.message.includes('请求超时')) {
+      errorMessage = '网络连接失败，请检查网络后重试';
+    } else if (error.message.includes('API响应解析失败')) {
+      errorMessage = '邮件服务响应异常，请稍后重试';
+    } else if (error.message.includes('邮箱格式')) {
+      errorMessage = '收件人邮箱地址无效';
+    } else {
+      errorMessage = `邮件发送失败: ${error.message}`;
+    }
+    res.status(500).json({ error: errorMessage });
   }
-}
-
-async function buildEmailContentWithCidImages(note, userId) {
-  let tableHtml = '';
-  if (note.sheet_data) {
-    try {
-      const sheetData = JSON.parse(note.sheet_data);
-      tableHtml = generateTableHtml(sheetData);
-    } catch (error) {
-      console.error('解析表格数据失败:', error);
-      tableHtml = '<p style="color: #666; font-style: italic;">表格数据解析失败</p>';
-    }
-  }
-
-  let processedContent = note.content || '<p style="color: #666; font-style: italic;">暂无内容</p>';
-  let imagesInfo = [];
-  let compressedFiles = [];
-  
-  if (note.content && note.content.includes('/uploads/')) {
-    const result = await processContentImagesToCidFormat(note.content, userId);
-    processedContent = result.html;
-    imagesInfo = result.imagesInfo;
-    compressedFiles = result.compressedFiles || [];
-  }
-
-  const html = `
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <style>
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-      line-height: 1.6;
-      color: #333;
-      max-width: 100%;
-      margin: 0;
-      padding: 15px;
-      -webkit-text-size-adjust: 100%;
-      -ms-text-size-adjust: 100%;
-    }
-    
-    .email-container {
-      max-width: 100%;
-      margin: 0 auto;
-    }
-    
-    .email-header {
-      border-bottom: 3px solid #2c5aa0;
-      padding-bottom: 15px;
-      margin-bottom: 20px;
-    }
-    
-    .email-title {
-      color: #2c5aa0;
-      font-size: 20px;
-      margin: 0;
-      word-wrap: break-word;
-      line-height: 1.3;
-    }
-    
-    .content-section {
-      margin-bottom: 20px;
-    }
-    
-    .section-title {
-      color: #2c5aa0;
-      font-size: 16px;
-      border-left: 4px solid #2c5aa0;
-      padding-left: 10px;
-      margin-bottom: 12px;
-    }
-    
-    .note-content {
-      background: #f8f9fa;
-      padding: 15px;
-      border-radius: 6px;
-      border: 1px solid #e9ecef;
-      max-width: 100%;
-      overflow: hidden;
-    }
-    
-    .note-content img {
-      max-width: 100% !important;
-      height: auto !important;
-      border-radius: 4px;
-      margin: 8px 0;
-      display: block;
-    }
-    
-    .note-content * {
-      max-width: 100%;
-    }
-    
-    .table-container {
-      overflow-x: auto;
-      margin: 12px 0;
-      -webkit-overflow-scrolling: touch;
-    }
-    
-    .email-table {
-      width: 100%;
-      border-collapse: collapse;
-      background: white;
-      min-width: 300px;
-    }
-    
-    .email-table th {
-      background-color: #2c5aa0;
-      color: white;
-      font-weight: bold;
-      text-align: left;
-      padding: 8px 10px;
-      font-size: 14px;
-    }
-    
-    .email-table td {
-      border: 1px solid #dee2e6;
-      padding: 8px 10px;
-      text-align: left;
-      font-size: 14px;
-    }
-    
-    .email-table tr:nth-child(even) {
-      background-color: #f8f9fa;
-    }
-    
-    .email-footer {
-      margin-top: 25px;
-      padding-top: 15px;
-      border-top: 1px solid #e9ecef;
-      color: #666;
-      font-size: 12px;
-      text-align: center;
-    }
-    
-    .meta-info {
-      background: #e7f3ff;
-      padding: 10px 12px;
-      border-radius: 6px;
-      margin-bottom: 15px;
-      font-size: 13px;
-      color: #555;
-    }
-  </style>
-</head>
-<body>
-  <div class="email-container">
-    <div class="email-header">
-      <h1 class="email-title">${note.title || '无标题笔记'}</h1>
-    </div>
-
-    <div class="meta-info">
-      <strong>创建时间：</strong>${formatDate(note.created_at)}<br>
-      <strong>更新时间：</strong>${formatDate(note.updated_at)}<br>
-      <strong>发送时间：</strong>${formatDate(new Date())}
-    </div>
-
-    <div class="content-section">
-      <h2 class="section-title">笔记内容</h2>
-      <div class="note-content">
-        ${processedContent}
-      </div>
-    </div>
-
-    ${tableHtml ? `
-    <div class="content-section">
-      <h2 class="section-title">表格数据</h2>
-      <div class="table-container">
-        ${tableHtml}
-      </div>
-    </div>
-    ` : ''}
-
-    <div class="email-footer">
-      <p>此邮件由个人笔记本系统自动发送</p>
-    </div>
-  </div>
-</body>
-</html>
-  `;
-
-  return { html, imagesInfo, compressedFiles };
-}
+});
 ```
 
----
+***
 
-## 4. 图片上传
-
-### 4.1 Multer 存储配置
+## 5. 图片上传与自动压缩
 
 **文件**: [backend/routes/upload.js](backend/routes/upload.js)
 
-```javascript
-import multer from 'multer';
-import path from 'path';
-import fs from 'fs';
-import sharp from 'sharp';
+### 5.1 Multer 存储配置
 
+```javascript
 const ALLOWED_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'];
 const ALLOWED_MIME_TYPES = [
   'image/jpeg',
@@ -722,26 +793,28 @@ const ALLOWED_MIME_TYPES = [
   'image/bmp',
   'image/svg+xml'
 ];
-const MAX_FILE_SIZE = 5 * 1024 * 1024;
+const MAX_FILE_SIZE = 5 * 1024 * 1024;  // 5MB
 const MAX_IMAGE_WIDTH = 1920;
 const MAX_IMAGE_HEIGHT = 1080;
 const JPEG_QUALITY = 85;
-const TARGET_IMAGE_SIZE = 2 * 1024 * 1024;
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const userId = req.headers['user-id'];
+    const userId = req.userId;
     if (!userId) {
       return cb(new Error('未授权访问'), null);
     }
     
+    // 按用户 ID 创建目录
     const userUploadsDir = path.join(__dirname, '../uploads', userId);
     if (!fs.existsSync(userUploadsDir)) {
       fs.mkdirSync(userUploadsDir, { recursive: true });
     }
+    
     cb(null, userUploadsDir);
   },
   filename: (req, file, cb) => {
+    // 生成唯一文件名
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
     const ext = path.extname(file.originalname).toLowerCase() || '.jpg';
     cb(null, 'image-' + uniqueSuffix + ext);
@@ -765,22 +838,24 @@ const fileFilter = (req, file, cb) => {
 const upload = multer({
   storage: storage,
   fileFilter: fileFilter,
-  limits: { fileSize: MAX_FILE_SIZE }
+  limits: {
+    fileSize: MAX_FILE_SIZE
+  }
 });
 ```
 
-### 4.2 图片自动压缩功能
+### 5.2 图片自动压缩
 
 ```javascript
 async function compressImage(imagePath, mimeType) {
   try {
     const ext = path.extname(imagePath).toLowerCase();
-    let outputPath = imagePath;
     let compressed = false;
     
     let image = sharp(imagePath);
     const metadata = await image.metadata();
     
+    // 计算目标尺寸
     let needsResize = false;
     let targetWidth = metadata.width;
     let targetHeight = metadata.height;
@@ -805,6 +880,7 @@ async function compressImage(imagePath, mimeType) {
       compressed = true;
     }
     
+    // 根据格式设置质量
     if (ext === '.jpg' || ext === '.jpeg') {
       image = image.jpeg({ quality: JPEG_QUALITY });
       compressed = true;
@@ -839,15 +915,11 @@ async function compressImage(imagePath, mimeType) {
 }
 ```
 
-### 4.3 上传接口（含图片压缩处理）
+### 5.3 上传接口
 
 ```javascript
-router.post('/upload-image', upload.single('image'), async (req, res) => {
-    const userId = req.headers['user-id'];
-    
-    if (!userId) {
-      return res.status(401).json({ error: '未授权访问' });
-    }
+router.post('/upload-image', verifyToken, upload.single('image'), async (req, res) => {
+    const userId = req.userId;
   
     if (!req.file) {
       return res.status(400).json({ error: '没有上传文件' });
@@ -866,11 +938,20 @@ router.post('/upload-image', upload.single('image'), async (req, res) => {
       const finalSize = compressResult.newSize || originalSize;
       const imageUrl = `/uploads/${userId}/${req.file.filename}`;
       
+      console.log('上传成功:', {
+        url: imageUrl,
+        originalName: req.file.originalName,
+        originalSize: `${(originalSize / 1024).toFixed(1)}KB`,
+        finalSize: `${(finalSize / 1024).toFixed(1)}KB`,
+        compressed: compressResult.compressed,
+        mimeType: req.file.mimeType
+      });
+      
       res.json({
         success: true,
         url: imageUrl,
         filename: req.file.filename,
-        originalName: req.file.originalname,
+        originalName: req.file.originalName,
         size: finalSize,
         originalSize: originalSize,
         compressed: compressResult.compressed,
@@ -883,144 +964,68 @@ router.post('/upload-image', upload.single('image'), async (req, res) => {
   });
 ```
 
----
+***
 
-## 5. 定时任务
-
-### 5.1 回收站自动清理
+## 6. 定时任务
 
 **文件**: [backend/scheduledTasks.js](backend/scheduledTasks.js)
 
 ```javascript
 import { db } from './app.js';
 
+// 定期清理回收站中超过30天的笔记
 function autoCleanTrash() {
   const thirtyDaysAgo = new Date();
   thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
 
-  // 格式化日期为 SQLite 支持的格式
+  // 格式化日期为SQLite支持的格式 (YYYY-MM-DD HH:MM:SS)
   const formattedDate = thirtyDaysAgo.toISOString().slice(0, 19).replace('T', ' ');
 
   const sql = `DELETE FROM note WHERE is_del = 1 AND updated_at < ?`;
   
   db.run(sql, [formattedDate], function(err) {
-    if (this.changes > 0) {
-      console.log(`自动清理了 ${this.changes} 条过期笔记`);
+    if (err) {
+      console.error('自动清理回收站失败:', err.message);
+    } else {
+      if (this.changes > 0) {
+        console.log(`[${new Date().toLocaleString()}] 自动清理了 ${this.changes} 条过期笔记`);
+      }
     }
   });
 }
 
 function startScheduledTasks() {
-  // 启动时执行一次
+  // 启动时立即执行一次
   autoCleanTrash();
   
   // 每24小时执行一次
   setInterval(autoCleanTrash, 24 * 60 * 60 * 1000);
   
-  console.log('定时任务已启动：回收站自动清理');
+  console.log('定时任务已启动：回收站自动清理（每24小时执行一次）');
 }
 
 export { startScheduledTasks };
 ```
 
----
-
-## 6. 前端编辑器
-
-### 6.1 笔记保存流程
-
-**文件**: [frontend/src/views/Edit.vue](frontend/src/views/Edit.vue)
-
-```javascript
-async saveNote() {
-  this.saving = true;
-  try {
-    const token = localStorage.getItem('token');
-    const response = await axios.post('/api/note', this.note, {
-      headers: { 'user-id': token }
-    });
-    
-    // 新建笔记时更新URL
-    if (!this.note.id) {
-      this.note.id = response.data.id;
-      this.$router.replace(`/edit/${this.note.id}`);
-    }
-    
-    this.showAlert('保存成功', '笔记已成功保存');
-  } catch (error) {
-    this.showAlert('保存失败', '保存笔记时出现错误');
-  } finally {
-    this.saving = false;
-  }
-}
-```
-
-### 6.2 邮件发送前端调用
-
-```javascript
-async handleEmailSubmit() {
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  if (!emailRegex.test(this.emailTo)) {
-    this.showAlert('提示', '请输入有效的邮箱地址');
-    return;
-  }
-  
-  this.sendingEmail = true;
-  try {
-    const token = localStorage.getItem('token');
-    
-    const response = await axios.post('/send-email', {
-      email: this.emailTo.trim(),
-      noteId: this.note.id.toString(),
-      userId: token
-    }, {
-      timeout: 30000
-    });
-    
-    this.showAlert('发送成功', '邮件发送成功！');
-    this.showEmailModal = false;
-  } catch (error) {
-    this.showAlert('发送失败', '邮件发送失败: ' + error.message);
-  } finally {
-    this.sendingEmail = false;
-  }
-}
-```
-
-### 6.3 分享链接生成
-
-```javascript
-async shareNote() {
-  if (!this.note.id) {
-    this.showAlert('提示', '请先保存笔记');
-    return;
-  }
-  
-  const shareUrl = window.location.origin + `/s/${this.note.id}`;
-  
-  try {
-    await navigator.clipboard.writeText(shareUrl);
-    this.showAlert('分享成功', '分享链接已复制到剪贴板');
-  } catch (error) {
-    // 降级方案：使用传统复制方法
-    const tempInput = document.createElement('input');
-    tempInput.value = shareUrl;
-    document.body.appendChild(tempInput);
-    tempInput.select();
-    document.execCommand('copy');
-    document.body.removeChild(tempInput);
-    this.showAlert('分享成功', '分享链接已复制到剪贴板');
-  }
-}
-```
-
----
+***
 
 ## 7. 数据库初始化
 
 **文件**: [backend/app.js](backend/app.js)
 
 ```javascript
+import sqlite3 from 'sqlite3';
+
+const db = new sqlite3.Database('./notebook.db', (err) => {
+  if (err) {
+    console.error('数据库连接失败:', err.message);
+  } else {
+    console.log('成功连接到SQLite数据库');
+    initDatabase();
+    startScheduledTasks();
+  }
+});
+
 function initDatabase() {
   // 用户表
   db.run(`CREATE TABLE IF NOT EXISTS user (
@@ -1040,58 +1045,187 @@ function initDatabase() {
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
+
+  // FTS5全文索引虚拟表
+  db.run(`CREATE VIRTUAL TABLE IF NOT EXISTS note_fts USING fts5(
+    id UNINDEXED,
+    user_id UNINDEXED,
+    title,
+    content,
+    tokenize = 'unicode61'
+  )`, (err) => {
+    if (err) {
+      console.log('FTS5表已存在或创建失败:', err.message);
+    } else {
+      console.log('FTS5全文索引表创建成功');
+    }
+  });
 }
+
+export { db };
 ```
 
----
+***
 
-## 8. API 路径配置
+## 8. 前端路由与认证
 
-**文件**: [frontend/src/config/apiPaths.js](frontend/src/config/apiPaths.js)
+**文件**: [frontend/src/router/index.js](frontend/src/router/index.js)
 
 ```javascript
-export const API_PATHS = {
-  AUTH: {
-    LOGIN: '/api/login',
-    REGISTER: '/api/register'
+import { createRouter, createWebHistory } from 'vue-router'
+import Login from '@/views/Login.vue'
+import Index from '@/views/Index.vue'
+import Edit from '@/views/Edit.vue'
+import Share from '@/views/Share.vue'
+
+const routes = [
+  { path: '/', redirect: '/login' },
+  { path: '/login', name: 'Login', component: Login },
+  { path: '/index', name: 'Index', component: Index },
+  { path: '/edit', name: 'Edit', component: Edit },
+  { path: '/edit/:id', name: 'EditNote', component: Edit },
+  { path: '/s/:shareId', name: 'Share', component: Share }
+]
+
+const router = createRouter({
+  history: createWebHistory(import.meta.env.BASE_URL),
+  routes
+})
+
+// 路由守卫
+router.beforeEach((to, from, next) => {
+  const token = sessionStorage.getItem('token')
+  console.log('路由守卫: ', to.path, 'token:', token)
+  
+  // 允许分享页面无需登录
+  if (to.path.startsWith('/s/')) {
+    next()
+  } else if (to.path !== '/login' && !token) {
+    console.log('未登录，跳转到登录页')
+    next('/login')
+  } else if (to.path === '/login' && token) {
+    console.log('已登录，跳转到首页')
+    next('/index')
+  } else {
+    console.log('正常导航')
+    next()
+  }
+})
+
+export default router
+```
+
+**文件**: [frontend/src/utils/axiosConfig.js](frontend/src/utils/axiosConfig.js)
+
+```javascript
+import axios from 'axios';
+
+const api = axios.create({
+  baseURL: '/',
+  timeout: 30000
+});
+
+// 请求拦截器：自动添加 Authorization header
+api.interceptors.request.use(
+  config => {
+    const token = sessionStorage.getItem('token');
+    if (token) {
+      config.headers['Authorization'] = `Bearer ${token}`;
+    }
+    return config;
   },
-  NOTES: {
-    LIST: '/api/notes',
-    DETAIL: (id) => `/api/note/${id}`,
-    CREATE: '/api/note',
-    UPDATE: (id) => `/api/note/${id}`,
-    DELETE: (id) => `/api/note/${id}`,
-    RECOVER: (id) => `/api/note/${id}/recover`
+  error => {
+    return Promise.reject(error);
+  }
+);
+
+// 响应拦截器：401 自动跳转登录
+api.interceptors.response.use(
+  response => {
+    return response;
   },
-  TRASH: {
-    LIST: '/api/trash/notes',
-    DELETE_PERMANENT: (id) => `/api/trash/note/${id}`
-  },
-  SHARE: {
-    DETAIL: (id) => `/api/s/${id}`
-  },
-  UPLOAD: {
-    IMAGE: '/api/upload-image'
-  },
-  EMAIL: {
-    SEND: '/send-email'
+  error => {
+    if (error.response && error.response.status === 401) {
+      sessionStorage.removeItem('token');
+      sessionStorage.removeItem('username');
+      window.location.href = '/login';
+    }
+    return Promise.reject(error);
+  }
+);
+
+export default api;
+```
+
+***
+
+## 9. 前端编辑器与笔记保存
+
+**文件**: [frontend/src/views/Edit.vue](frontend/src/views/Edit.vue)
+
+```javascript
+async saveNote() {
+  this.saving = true;
+  try {
+    const response = await api.post('/api/note', this.note);
+    
+    // 新建笔记时更新URL
+    if (!this.note.id) {
+      this.note.id = response.data.id;
+      this.$router.replace(`/edit/${this.note.id}`);
+    }
+    
+    this.showAlert('保存成功', '笔记已成功保存');
+  } catch (error) {
+    console.error('保存失败:', error);
+    this.showAlert('保存失败', '保存笔记时出现错误，请稍后重试');
+  } finally {
+    this.saving = false;
+  }
+},
+
+async handleEmailSubmit() {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(this.emailTo)) {
+    this.showAlert('提示', '请输入有效的邮箱地址');
+    return;
+  }
+  
+  this.sendingEmail = true;
+  try {
+    const response = await api.post('/send-email', {
+      email: this.emailTo.trim(),
+      noteId: this.note.id.toString()
+    }, {
+      timeout: 30000
+    });
+    
+    this.showAlert('发送成功', '邮件发送成功！');
+    this.showEmailModal = false;
+  } catch (error) {
+    this.showAlert('发送失败', '邮件发送失败: ' + (error.response?.data?.error || error.message));
+  } finally {
+    this.sendingEmail = false;
   }
 }
 ```
 
----
+***
 
-## 关键技术要点
+## 关键技术要点总结
 
-| 功能 | 技术要点 |
-|------|----------|
-| 密码安全 | bcrypt 加密，salt rounds = 10 |
-| 用户隔离 | 通过 user-id header 识别用户，所有操作带用户校验 |
-| 软删除 | is_del 字段标记，支持恢复和定时清理 |
-| 本地时间显示 | 使用服务器本地时间存储，不再手动时区转换，支持相对时间（刚刚、分钟前、小时前）和绝对时间，每30秒实时同步 |
-| 邮件发送 | SendCloud API V2，FormData multipart/form-data，支持 CID 内嵌图片，邮件图片自动压缩至≤2MB |
-| 图片上传 | Multer 处理，按用户分目录存储，5MB 限制，双重验证，上传时自动压缩（最大1920x1080，JPEG 85%质量） |
-| 图片拖拽 | 支持拖拽上传，多图批量上传，进度显示 |
-| 定时任务 | setInterval 实现，每24小时清理一次 |
-| 前端状态 | localStorage 存储 token，axios 拦截器统一处理 |
-| 错误提示 | 统一模态框提示，替代原生 alert |
+| 功能     | 技术要点                                                   |
+| ------ | ------------------------------------------------------ |
+| 密码安全   | bcrypt 加密，salt rounds = 10                             |
+| JWT 认证 | jsonwebtoken，7天有效期，向后兼容 user-id header                 |
+| 用户隔离   | 通过 JWT 中间件获取 userId，所有操作带用户校验                          |
+| 软删除    | is\_del 字段标记，支持恢复和定时清理                                 |
+| 本地时间   | 使用服务器本地时间存储，格式 YYYY-MM-DD HH:MM:SS                     |
+| 全文搜索   | SQLite FTS5 + unicode61 分词器，失败自动降级到 LIKE               |
+| 邮件发送   | SendCloud API V2，FormData multipart/form-data，CID 内嵌图片 |
+| 图片压缩   | Sharp 库，上传时 1920x1080 + JPEG 85%，邮件时 ≤2MB              |
+| 图片存储   | Multer 处理，按用户 ID 分目录，5MB 限制，双重验证                       |
+| 定时任务   | setInterval，每24小时清理30天前回收站                             |
+| 前端状态   | sessionStorage 存储 token，axios 拦截器统一处理                  |
+| 路由守卫   | 未登录跳转登录页，分享页无需登录                                       |
+

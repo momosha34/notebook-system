@@ -62,6 +62,21 @@ function initDatabase() {
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
+
+  // FTS5全文索引虚拟表（用于高性能搜索）
+  db.run(`CREATE VIRTUAL TABLE IF NOT EXISTS note_fts USING fts5(
+    id UNINDEXED,
+    user_id UNINDEXED,
+    title,
+    content,
+    tokenize = 'unicode61'
+  )`, (err) => {
+    if (err) {
+      console.log('FTS5表已存在或创建失败:', err.message);
+    } else {
+      console.log('FTS5全文索引表创建成功');
+    }
+  });
 }
 
 // 健康检查接口，返回服务状态
