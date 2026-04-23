@@ -3,12 +3,19 @@
     <div class="editor-header">
       <h3>高级表格编辑器</h3>
       <div class="header-actions">
-        <button @click="saveAndClose" class="btn-primary">保存并关闭</button>
+        <button @click="saveAndClose" class="btn-primary" :disabled="isSaving">
+          {{ isSaving ? '保存中...' : '保存并关闭' }}
+        </button>
         <button @click="close" class="cancel-btn">取消</button>
       </div>
     </div>
     
     <div class="sheet-container">
+      <!-- 加载状态 -->
+      <div v-if="isLoading" class="loading-overlay">
+        <div class="loading-spinner"></div>
+        <p>表格加载中，请稍候...</p>
+      </div>
       <div id="luckysheet-container" style="width: 100%; height: 600px;"></div>
     </div>
   </div>
@@ -23,7 +30,9 @@ export default {
   emits: ['save', 'close'],
   data() {
     return {
-      luckysheet: null
+      luckysheet: null,
+      isSaving: false,
+      isLoading: true
     }
   },
   mounted() {
@@ -34,24 +43,29 @@ export default {
   },
   methods: {
     initSheet() {
-      // 等待 Luckysheet 加载完成
-      if (window.luckysheet) {
-        this.createSheet();
-      } else {
-        // 如果 Luckysheet 尚未加载，等待一段时间
-        setTimeout(() => {
-          if (window.luckysheet) {
-            this.createSheet();
-          } else {
-            console.error('Luckysheet 加载失败');
-            alert('表格编辑器加载失败，请刷新页面重试');
-          }
-        }, 1000);
-      }
+      // 等待 Luckysheet 加载完成，使用轮询方式确保可靠性
+      let attempts = 0;
+      const maxAttempts = 30; // 最多尝试30次
+      const interval = 200; // 每200ms尝试一次
+      
+      const checkLuckysheet = () => {
+        attempts++;
+        if (window.luckysheet) {
+          this.createSheet();
+        } else if (attempts >= maxAttempts) {
+          console.error('Luckysheet 加载失败（超时）');
+          alert('表格编辑器加载失败，请刷新页面重试');
+        } else {
+          setTimeout(checkLuckysheet, interval);
+        }
+      };
+      
+      checkLuckysheet();
     },
     
     createSheet() {
       try {
+        // 基础配置
         const options = {
           container: 'luckysheet-container',
           title: '笔记表格',
@@ -60,8 +74,6 @@ export default {
           showsheetbar: false,
           showtoolbar: true,
           showstatisticBar: true,
-          row: 20,
-          column: 15,
           allowEdit: true,
           enableAddRow: true,
           enableAddBackTop: true,
@@ -78,22 +90,50 @@ export default {
           }]
         };
 
-        // 如果有现有数据，加载它
+        // 如果有现有数据，加载它并根据数据量调整配置
         if (this.modelValue) {
           try {
             const parsedData = JSON.parse(this.modelValue);
             if (Array.isArray(parsedData) && parsedData.length > 0) {
               options.data = parsedData;
+              
+              // 根据数据量动态调整表格配置
+              const maxRow = parsedData.reduce((max, sheet) => {
+                return Math.max(max, sheet.data ? sheet.data.length : 0);
+              }, 0);
+              
+              const maxCol = parsedData.reduce((max, sheet) => {
+                if (sheet.data && sheet.data.length > 0) {
+                  return Math.max(max, sheet.data[0].length);
+                }
+                return max;
+              }, 0);
+              
+              // 设置合适的行数和列数，预留一定空间
+              options.row = Math.max(20, maxRow + 10);
+              options.column = Math.max(15, maxCol + 5);
+              
+              // 对于大数据量表格，优化性能
+              if (maxRow > 100 || maxCol > 30) {
+                options.enableAddRow = false; // 禁用自动添加行
+                options.showstatisticBar = false; // 禁用状态栏
+              }
             }
           } catch (error) {
             console.error('解析表格数据失败:', error);
+            alert('表格数据解析失败，将使用空表格');
           }
+        } else {
+          // 默认配置
+          options.row = 20;
+          options.column = 15;
         }
 
         // 先销毁可能存在的实例
-        if (window.luckysheet) {
+        if (window.luckysheet && window.luckysheet.isInitialized) {
           try {
             window.luckysheet.destroy();
+            window.luckysheet = null;
           } catch (e) {
             console.warn('销毁现有表格实例失败:', e);
           }
@@ -101,9 +141,16 @@ export default {
 
         // 创建新实例
         this.luckysheet = window.luckysheet.create(options);
+        // 标记实例已初始化
+        if (window.luckysheet) {
+          window.luckysheet.isInitialized = true;
+        }
+        // 加载完成
+        this.isLoading = false;
       } catch (error) {
         console.error('初始化表格失败:', error);
-        alert('表格初始化失败');
+        alert('表格初始化失败，请刷新页面重试');
+        this.isLoading = false;
       }
     },
     
@@ -111,24 +158,44 @@ export default {
       if (this.luckysheet && window.luckysheet) {
         try {
           window.luckysheet.destroy();
+          // 清理引用
+          this.luckysheet = null;
+          if (window.luckysheet) {
+            window.luckysheet.isInitialized = false;
+          }
         } catch (error) {
           console.error('销毁表格失败:', error);
+          // 即使销毁失败，也要清理引用
+          this.luckysheet = null;
+          if (window.luckysheet) {
+            window.luckysheet.isInitialized = false;
+          }
         }
+      } else {
+        // 确保引用被清理
+        this.luckysheet = null;
       }
     },
     
     saveAndClose() {
+      if (this.isSaving) return; // 防止重复保存
+      
       if (window.luckysheet) {
+        this.isSaving = true;
         try {
+          // 优化大表格数据获取
           const data = window.luckysheet.getAllSheets();
-          this.$emit('save', JSON.stringify(data));
+          // 压缩数据，移除空单元格和默认值
+          const compressedData = this.compressSheetData(data);
+          this.$emit('save', JSON.stringify(compressedData));
         } catch (error) {
           console.error('保存表格数据失败:', error);
           // 尝试使用实例方法
           if (this.luckysheet) {
             try {
               const data = this.luckysheet.getAllSheets();
-              this.$emit('save', JSON.stringify(data));
+              const compressedData = this.compressSheetData(data);
+              this.$emit('save', JSON.stringify(compressedData));
             } catch (e) {
               console.error('使用实例方法保存失败:', e);
               alert('保存失败');
@@ -136,11 +203,37 @@ export default {
           } else {
             alert('保存失败');
           }
+        } finally {
+          this.isSaving = false;
         }
       } else {
         alert('表格编辑器未初始化');
       }
       this.close();
+    },
+    
+    // 压缩表格数据，移除空单元格和默认值
+    compressSheetData(data) {
+      if (!Array.isArray(data)) return data;
+      
+      return data.map(sheet => {
+        // 移除空的celldata
+        if (sheet.celldata && sheet.celldata.length === 0) {
+          delete sheet.celldata;
+        }
+        // 移除空的rows和columns配置
+        if (sheet.rows && Object.keys(sheet.rows).length === 0) {
+          delete sheet.rows;
+        }
+        if (sheet.columns && Object.keys(sheet.columns).length === 0) {
+          delete sheet.columns;
+        }
+        // 移除空的config
+        if (sheet.config && Object.keys(sheet.config).length === 0) {
+          delete sheet.config;
+        }
+        return sheet;
+      });
     },
     
     close() {
@@ -270,6 +363,44 @@ export default {
 
 .sheet-container {
   padding: 20px;
+  position: relative;
+}
+
+/* 加载状态样式 */
+.loading-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(255, 255, 255, 0.9);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  z-index: 1000;
+  border-radius: 8px;
+}
+
+.loading-spinner {
+  width: 40px;
+  height: 40px;
+  border: 4px solid #f3f3f3;
+  border-top: 4px solid var(--primary);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+  margin-bottom: 16px;
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+.loading-overlay p {
+  color: #6b7280;
+  font-size: 14px;
+  margin: 0;
 }
 
 .btn-primary {
@@ -280,6 +411,12 @@ export default {
   border-radius: 8px;
   cursor: pointer;
   font-weight: 500;
+  transition: background 0.2s;
+}
+
+.btn-primary:disabled {
+  background: #93c5fd;
+  cursor: not-allowed;
 }
 
 .cancel-btn {
@@ -289,9 +426,10 @@ export default {
   border: 1px solid #d1d5db;
   border-radius: 8px;
   cursor: pointer;
+  transition: background 0.2s;
 }
 
-.btn-primary:hover {
+.btn-primary:hover:not(:disabled) {
   background: #1e3a8a;
 }
 
